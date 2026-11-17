@@ -56,10 +56,14 @@ def shock_physics_tutorial(
     # [Velocity (m/s -> cm/us), Density (kg/m^3 -> g/cm^3), Energy (J/kg -> Mbar*cm^3/g), 1, Length (m -> cm), Time (s -> us)]
     uc = [1e4, 1e3, 1e8, 1.0, 1e-2, 1e-6]
 
+    # Load Target (Common to all modes)
+    mat_T = load_mat(TargName, uc, TargTemp)
+    h_T = TargThick / uc[4]
+
     # 2. Validation & Geometry Loading --------------------------------------
     if mode_lower == "impact":
-        if Velocity == 0 or ProjName == "" or ProjThick == 0:
-            raise ValueError("Impact Mode requires: Velocity, ProjName, and ProjThick.")
+        if Velocity <= 0 or ProjName == "" or ProjThick <= 0:
+            raise ValueError("Impact Mode requires: Velocity (> 0), ProjName, and ProjThick (> 0).")
         
         calc_projectile = True
         mat_P = load_mat(ProjName, uc, ProjTemp)
@@ -74,8 +78,8 @@ def shock_physics_tutorial(
             print(f"Projectile: {ProjName} ({ProjThick*1e3:.2f} mm) | Target: {TargName} ({TargThick*1e3:.2f} mm)\n")
 
     elif mode_lower == "pressure":
-        if Pressure == 0 or Duration == 0:
-            raise ValueError("Pressure Mode requires: Pressure (Pa) and Duration (s).")
+        if Pressure <= 0 or Duration <= 0:
+            raise ValueError("Pressure Mode requires: Pressure (Pa > 0) and Duration (s > 0).")
         
         calc_projectile = False
         driver_val = Pressure / 1e11  # Pa -> Mbar
@@ -89,10 +93,16 @@ def shock_physics_tutorial(
             print(f"Target: {TargName} ({TargThick*1e3:.2f} mm)\n")
 
     elif mode_lower == "volume":
-        if VolumeRatio == 0 or Duration == 0:
-            raise ValueError("Volume Mode requires: VolumeRatio (v/v0) and Duration (s).")
+        if VolumeRatio <= 0 or Duration <= 0:
+            raise ValueError("Volume Mode requires: VolumeRatio (v/v0 > 0) and Duration (s > 0).")
         if VolumeRatio >= 1.0:
             raise ValueError("Volume Ratio must be < 1.0 for compression.")
+        min_vol_ratio = 1.0 - 1.0 / mat_T["S"]
+        if VolumeRatio <= min_vol_ratio:
+            raise ValueError(
+                f"Volume Ratio ({VolumeRatio:.4f}) exceeds the theoretical maximum compression limit "
+                f"(1 - 1/S = {min_vol_ratio:.4f}) for {TargName}."
+            )
         
         calc_projectile = False
         driver_val = VolumeRatio
@@ -105,47 +115,48 @@ def shock_physics_tutorial(
             print(f"Volume Ratio:    {VolumeRatio:.4f}")
             print(f"Target: {TargName} ({TargThick*1e3:.2f} mm)\n")
 
-    # Load Target (Common to all modes)
-    mat_T = load_mat(TargName, uc, TargTemp)
-    h_T = TargThick / uc[4]
-
     # 3. The Calculation Branch ---------------------------------------------
     if calc_projectile:
-        # === PATH A: IMPACT MODE (up -> P) ===
+        # === PATH A: IMPACT MODE (up -> P, Eq 20 - 25) ===
         rhoP, CP, SP = mat_P["rho0"], mat_P["C0"], mat_P["S"]
         rhoT, CT, ST = mat_T["rho0"], mat_T["C0"], mat_T["S"]
 
         if rhoP == rhoT and CP == CT and SP == ST:
-            # Symmetric Impact
+            # Symmetric Impact (Eq 22)
             x_dot = 0.5 * x_dot_P
         else:
-            # Unsymmetric Impact
-            term1 = 1.0 / (2.0 * (rhoP * SP - rhoT * ST))
-            term2 = rhoP * CP + rhoT * CT + 2.0 * x_dot_P * rhoP * SP
-            term3 = (rhoP * CP + rhoT * CT)**2 + 4.0 * x_dot_P * rhoP * rhoT * (CP * ST + CT * SP + SP * ST * x_dot_P)
-            x_dot = term1 * (term2 - math.sqrt(term3))
-            print("********************* WARNING *********************")
-            print("Code assumes a releasae to zero pressure in both the projectile and target!")
-            print("This is accurate behind the free surfaces, not necessarily at the impact interface!\n")
+            # Unsymmetric Impact (Eq 23)
+            if abs(rhoP * SP - rhoT * ST) < 1e-12:
+                # Linear fallback when quadratic coefficient (rhoP*SP - rhoT*ST) vanishes
+                x_dot = (rhoP * (CP + SP * x_dot_P) * x_dot_P) / (rhoP * CP + rhoT * CT + 2.0 * x_dot_P * rhoP * SP)
+            else:
+                term1 = 1.0 / (2.0 * (rhoP * SP - rhoT * ST))
+                term2 = rhoP * CP + rhoT * CT + 2.0 * x_dot_P * rhoP * SP
+                term3 = (rhoP * CP + rhoT * CT)**2 + 4.0 * x_dot_P * rhoP * rhoT * (CP * ST + CT * SP + SP * ST * x_dot_P)
+                x_dot = term1 * (term2 - math.sqrt(term3))
 
+            if Verbose:
+                print("********************* WARNING *********************")
+                print("Code assumes a release to zero pressure in both the projectile and target!")
+                print("This is accurate behind the free surfaces, not necessarily at the impact interface!\n")
 
-        # Target Shock Velocity
+        # Target Shock Velocity (Eq 9)
         U_ST = CT + ST * x_dot
 
         # Projectile Effective Velocities
         x_dot_P_effective = x_dot_P - x_dot
         U_SP_effective = CP + SP * x_dot_P_effective
 
-        # Calculate Pressure
+        # Calculate Pressure (Eq 20)
         p_T = rhoT * U_ST * x_dot
         p_P = rhoP * U_SP_effective * x_dot_P_effective
 
-        # Calculate Specific Volumes
+        # Calculate Specific Volumes (Eq 24)
         v_T = mat_T["v0"] * (1.0 - x_dot / U_ST)
         v_P = mat_P["v0"] * (1.0 - x_dot_P_effective / U_SP_effective)
 
     elif mode_lower == "pressure":
-        # === PATH B: PRESSURE MODE (P -> up) ===
+        # === PATH B: PRESSURE MODE (P -> up, Inversion of Eq 38) ===
         p_T = driver_val
         rhoT, CT, ST, v0T = mat_T["rho0"], mat_T["C0"], mat_T["S"], mat_T["v0"]
 
@@ -158,7 +169,7 @@ def shock_physics_tutorial(
         U_ST = CT + ST * x_dot
 
     elif mode_lower == "volume":
-        # === PATH C: VOLUME MODE (J -> up -> P) ===
+        # === PATH C: VOLUME MODE (J -> up -> P, Eq 25, 9, 20) ===
         J_T = driver_val
         v_T = mat_T["v0"] * J_T
 
@@ -170,7 +181,7 @@ def shock_physics_tutorial(
     # 4. Shared Physics Calculations (Thermodynamics & Release) -------------
     # --- TARGET CALCULATIONS ---
     J_T = v_T / mat_T["v0"]
-    eps_jump_T = 0.5 * p_T * (mat_T["v0"] - v_T)
+    eps_jump_T = 0.5 * p_T * (mat_T["v0"] - v_T)  # Eq 26
     theta_T, eta_jump_T = hugoniot_temp_ent(v_T, mat_T)
     v_2T, eps_jump_2T, C_L_head_T, C_L_tail_T, x_dot_fs_T = isentrope_release(v_T, p_T, x_dot, mat_T)
     J_2T = v_2T / mat_T["v0"]
@@ -179,19 +190,20 @@ def shock_physics_tutorial(
     # --- PROJECTILE CALCULATIONS (If Impact Mode) ---
     if calc_projectile:
         J_P = v_P / mat_P["v0"]
-        eps_jump_P = 0.5 * p_P * (mat_P["v0"] - v_P)
+        eps_jump_P = 0.5 * p_P * (mat_P["v0"] - v_P)  # Eq 26
         theta_P, eta_jump_P = hugoniot_temp_ent(v_P, mat_P)
-        v_2P, eps_jump_2P, C_L_head_P, C_L_tail_P, _ = isentrope_release(v_P, p_P, x_dot, mat_P)
+        v_2P, eps_jump_2P, C_L_head_P, C_L_tail_P, _ = isentrope_release(v_P, p_P, x_dot_P_effective, mat_P)
         J_2P = v_2P / mat_P["v0"]
         theta_2P = isentrope_temp(mat_P, theta_P, v_P, v_2P)
 
+        # Initial Shock Pulse Duration (Eq 68)
         t_pulse_shock = h_P / U_SP_effective + h_P / C_L_head_P
     else:
         t_pulse_shock = t_pulse_defined
 
-    # --- TIMING CALCULATIONS (Target) ---
+    # --- TIMING CALCULATIONS (Target, Eq 69 & 70) ---
     h_o = t_pulse_shock * ((1.0 / U_ST - 1.0 / C_L_head_T)**(-1))
-    t_pulse_fs = (h_o - h_T) * np.sqrt(C_L_head_T/C_L_tail_T) * (1/U_ST - 1/C_L_head_T)
+    t_pulse_fs = (h_o - h_T) * np.sqrt(C_L_head_T / C_L_tail_T) * (1.0 / U_ST - 1.0 / C_L_head_T)
     if t_pulse_fs < 0:
         t_pulse_fs = 0.0
 
@@ -312,7 +324,7 @@ def load_mat(name, uc, T_init):
 
 
 def hugoniot_temp_ent(v, mat):
-    """Eq 38 & 41: Temperature and specific entropy jump along the Hugoniot."""
+    """Eq 40 & 43: Temperature and specific entropy jump along the Hugoniot."""
     v_R = mat["v0"]
     S = mat["S"]
     g0 = mat["gamma0"]
@@ -327,13 +339,13 @@ def hugoniot_temp_ent(v, mat):
     def theta_integrand(V):
         return (1.0 / chi_c(V)) * (((v_R - V)**2) / ((1.0 - rhoR * S * (v_R - V))**3))
 
-    int_opts = {"epsrel": 1e-4, "epsabs": 1e-6}
+    int_opts = {"epsrel": 1e-8, "epsabs": 1e-12}
 
-    # Calculate Temperature
+    # Calculate Temperature (Eq 40)
     int_val, _ = quad(theta_integrand, v_R, v, **int_opts)
     theta = chi_c(v) * (T0 - ((rhoR**3 * S * C0**2) / Cv) * int_val)
 
-    # Calculate specific entropy jump (Eq 41)
+    # Calculate specific entropy jump (Eq 43)
     def theta_fun(V):
         val, _ = quad(theta_integrand, v_R, V, **int_opts)
         return chi_c(V) * (T0 - ((rhoR**3 * S * C0**2) / Cv) * val)
@@ -355,7 +367,7 @@ def isentrope_release(v, p, x_dot, mat):
     C0 = mat["C0"]
     rhoR = mat["rho0"]
 
-    int_opts = {"epsrel": 1e-4, "epsabs": 1e-6}
+    int_opts = {"epsrel": 1e-8, "epsabs": 1e-12}
 
     def p_H(V):
         return (rhoR * C0**2 * ((v_R - V) / v_R)) / (1.0 - S * ((v_R - V) / v_R))**2
@@ -376,23 +388,23 @@ def isentrope_release(v, p, x_dot, mat):
         val, _ = quad(p_eta_integrand, v, V, **int_opts)
         return chi_c(V) * (p_H(v) + val)
 
-    # Find Released Volume v_2 where P_is(v_2) = 0 (Eq 53)
+    # Find Released Volume v_2 where P_is(v_2) = 0 (Eq 53 & 56)
     sol = root_scalar(p_eta_func, x0=v_R, x1=v_R * 1.05, method="secant")
     v_2 = sol.root
 
-    # Calculate specific internal energy difference in the released state (Eq 54)
+    # Calculate specific internal energy difference in the released state (Eq 57)
     eps_release_integral, _ = quad(p_eta_func, v, v_2, **int_opts)
     eps_shock = 0.5 * p * (v_R - v)
     eps_jump_2 = eps_shock - eps_release_integral
 
-    # Lagrangian Sound Speed (C_L, Eq 61)
+    # Lagrangian Sound Speed (C_L, Eq 64)
     def C_L_fun(V):
         return math.sqrt((1.0 / rhoR**2) * ((g0 / v_R) * p_eta_func(V) - kappa_c(V)))
 
     C_L_head = C_L_fun(v)
     C_L_tail = C_L_fun(v_2)
 
-    # Free Surface Velocity (Eq 69)
+    # Free Surface Velocity (Eq 72)
     fs_int, _ = quad(C_L_fun, v, v_2, **int_opts)
     x_dot_fs = x_dot + (1.0 / v_R) * fs_int
 
@@ -400,7 +412,7 @@ def isentrope_release(v, p, x_dot, mat):
 
 
 def isentrope_temp(mat, theta, v, v_2):
-    """Temperature along the isentrope (Eq 58)."""
+    """Temperature along the isentrope (Eq 61)."""
     return theta * math.exp((mat["gamma0"] / mat["v0"]) * (v - v_2))
 
 
